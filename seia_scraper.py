@@ -56,7 +56,6 @@ def fechar_modal_aviso(driver, wait):
         return False
 
 
-
 def fazer_login(driver, wait, login, senha, callback=None):
     driver.get(URL_LOGIN)
 
@@ -90,7 +89,6 @@ def fazer_login(driver, wait, login, senha, callback=None):
 
     if callback:
         callback("✓ Login realizado com sucesso")
-
 
 
 def navegar_para_consulta(driver, wait, callback=None):
@@ -132,18 +130,31 @@ def navegar_para_consulta(driver, wait, callback=None):
         callback("✓ Tela de consulta carregada")
 
 
-
 def consultar_processo(driver, wait, numero):
+    """
+    Pesquisa o processo na listagem e retorna um dict com:
+      - status
+      - nome_empreendimento
+      - email
+    Abre o painel de detalhes e extrai as informações adicionais.
+    """
+    resultado = {
+        "status": "ERRO",
+        "nome_empreendimento": "",
+        "email": "",
+    }
+
     try:
+        # ── 1. Limpar busca anterior ──────────────────────────────────────
         botao_limpar = wait.until(
             EC.element_to_be_clickable(
                 (By.ID, "formConsultarProcesso:botao_limpar")
             )
         )
-
         botao_limpar.click()
         time.sleep(1.5)
 
+        # ── 2. Digitar número e consultar ─────────────────────────────────
         campo_busca = wait.until(
             EC.presence_of_element_located(
                 (
@@ -152,7 +163,6 @@ def consultar_processo(driver, wait, numero):
                 )
             )
         )
-
         campo_busca.clear()
         campo_busca.send_keys(numero)
 
@@ -161,6 +171,7 @@ def consultar_processo(driver, wait, numero):
             "formConsultarProcesso:botao_consultar"
         ).click()
 
+        # ── 3. Aguardar resultado na tabela ───────────────────────────────
         wait.until(
             EC.presence_of_element_located(
                 (
@@ -170,15 +181,195 @@ def consultar_processo(driver, wait, numero):
             )
         )
 
+        # ── 4. Ler status da listagem ─────────────────────────────────────
         status_element = driver.find_element(
             By.CSS_SELECTOR,
             "#formConsultarProcesso\\:dataTableProcesso tbody tr:first-child td:last-child div.ui-dt-c"
         )
+        resultado["status"] = status_element.text.strip()
 
-        return status_element.text.strip()
+        # ── 5. Abrir detalhes do processo ─────────────────────────────────
+        #   Clica no link/botão da primeira linha da tabela para abrir o painel
+        link_processo = wait.until(
+            EC.element_to_be_clickable(
+                (
+                    By.CSS_SELECTOR,
+                    "#formConsultarProcesso\\:dataTableProcesso tbody tr:first-child td:first-child a"
+                )
+            )
+        )
+        link_processo.click()
 
-    except Exception:
-        return "ERRO"
+        # Aguarda o painel de detalhes aparecer
+        wait.until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, ".ui-dialog[id*='DialogDetalharProcesso'], "
+                                  ".ui-dialog[id*='dialogDetalharProcesso'], "
+                                  "div[id*='DialogDetalharProcesso']")
+            )
+        )
+        time.sleep(1)
+
+        # ── 6. Extrair nome do empreendimento ─────────────────────────────
+        #   Na aba "Atos e Dados Gerais" / painel principal, o nome aparece
+        #   como texto numa célula ou label específico.
+        nome = _extrair_nome_empreendimento(driver)
+        resultado["nome_empreendimento"] = nome
+
+        # ── 7. Navegar para aba de dados gerais e extrair e-mail ──────────
+        email = _extrair_email(driver, wait)
+        resultado["email"] = email
+
+        # ── 8. Fechar painel de detalhes ──────────────────────────────────
+        _fechar_painel_detalhes(driver, wait)
+
+    except Exception as e:
+        # Tenta fechar o painel caso tenha ficado aberto
+        try:
+            _fechar_painel_detalhes(driver, wait)
+        except Exception:
+            pass
+
+        resultado["status"] = "ERRO"
+
+    return resultado
+
+
+# ─────────────────────────────────────────────
+# FUNÇÕES AUXILIARES DE EXTRAÇÃO
+# ─────────────────────────────────────────────
+
+def _extrair_nome_empreendimento(driver):
+    """
+    Tenta extrair o nome do empreendimento do painel de detalhes do processo.
+    O SEIA exibe essa informação num label/célula identificada por 'nomeEmpreendimento'
+    ou dentro de uma tabela de dados gerais do processo.
+    Tenta múltiplas estratégias para maior robustez.
+    """
+    estrategias = [
+        # Estratégia 1: campo com id ou name contendo 'nomeEmpreendimento'
+        lambda d: d.find_element(
+            By.XPATH,
+            "//*[contains(@id,'nomeEmpreendimento') or contains(@name,'nomeEmpreendimento')]"
+        ).text.strip(),
+
+        # Estratégia 2: label "Nome / Razão Social" seguido do valor
+        lambda d: d.find_element(
+            By.XPATH,
+            "//td[contains(normalize-space(),'Nome') and contains(normalize-space(),'Razão')]/following-sibling::td[1]"
+        ).text.strip(),
+
+        # Estratégia 3: linha da tabela com rótulo "Empreendimento"
+        lambda d: d.find_element(
+            By.XPATH,
+            "//td[normalize-space()='Empreendimento']/following-sibling::td[1]"
+        ).text.strip(),
+
+        # Estratégia 4: célula genérica de nome dentro do dialog de detalhes
+        lambda d: d.find_element(
+            By.XPATH,
+            "//div[contains(@id,'DetalharProcesso') or contains(@id,'detalharProcesso')]"
+            "//td[contains(normalize-space(.),'Nome')]/following-sibling::td[1]"
+        ).text.strip(),
+    ]
+
+    for fn in estrategias:
+        try:
+            valor = fn(driver)
+            if valor:
+                return valor
+        except Exception:
+            continue
+
+    return ""
+
+
+def _extrair_email(driver, wait):
+    """
+    Navega para a aba 'Atos e Dados Gerais' (ou 'Dados Gerais') dentro do
+    painel de detalhes e extrai o e-mail do responsável/requerente.
+    """
+    # ── Tenta clicar na aba 'Atos e Dados Gerais' ───────────────────────
+    seletores_aba = [
+        "//a[normalize-space()='Atos e Dados Gerais']",
+        "//a[normalize-space()='Dados Gerais']",
+        "//span[normalize-space()='Atos e Dados Gerais']",
+        "//li[contains(@class,'ui-tabs-header')]//a[contains(normalize-space(),'Dados')]",
+    ]
+
+    aba_clicada = False
+    for xpath in seletores_aba:
+        try:
+            aba = wait.until(EC.element_to_be_clickable((By.XPATH, xpath)))
+            aba.click()
+            time.sleep(1)
+            aba_clicada = True
+            break
+        except Exception:
+            continue
+
+    # ── Extrai o e-mail ──────────────────────────────────────────────────
+    estrategias_email = [
+        # Estratégia 1: campo com id/name contendo 'email' (case-insensitive via translate)
+        lambda d: d.find_element(
+            By.XPATH,
+            "//*[contains(translate(@id,'EMAIL','email'),'email') "
+            "or contains(translate(@name,'EMAIL','email'),'email')]"
+        ).text.strip(),
+
+        # Estratégia 2: label 'E-mail' / 'Email' seguido da célula vizinha
+        lambda d: d.find_element(
+            By.XPATH,
+            "//td[contains(normalize-space(),'E-mail') or contains(normalize-space(),'Email')]"
+            "/following-sibling::td[1]"
+        ).text.strip(),
+
+        # Estratégia 3: texto que parece um e-mail (contém '@') dentro do dialog
+        lambda d: d.find_element(
+            By.XPATH,
+            "//div[contains(@id,'DetalharProcesso') or contains(@id,'detalharProcesso')]"
+            "//*[contains(text(),'@')]"
+        ).text.strip(),
+
+        # Estratégia 4: dentro de qualquer elemento com 'role' dentro do dialog
+        lambda d: d.find_element(
+            By.XPATH,
+            "//td[normalize-space()='E-mail']/following-sibling::td[1]"
+        ).text.strip(),
+    ]
+
+    for fn in estrategias_email:
+        try:
+            valor = fn(driver)
+            if valor and "@" in valor:
+                return valor
+        except Exception:
+            continue
+
+    return ""
+
+
+def _fechar_painel_detalhes(driver, wait):
+    """
+    Fecha o painel/dialog de detalhes do processo.
+    Tenta clicar no botão de fechar (×) do dialog.
+    """
+    seletores_fechar = [
+        ".ui-dialog[id*='DialogDetalharProcesso'] a.ui-dialog-titlebar-close",
+        ".ui-dialog[id*='dialogDetalharProcesso'] a.ui-dialog-titlebar-close",
+        "a.ui-dialog-titlebar-close",
+    ]
+
+    for seletor in seletores_fechar:
+        try:
+            botao = wait.until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, seletor))
+            )
+            botao.click()
+            time.sleep(0.8)
+            return
+        except Exception:
+            continue
 
 
 # ─────────────────────────────────────────────
@@ -227,17 +418,23 @@ def executar_consulta(login, senha, csv_entrada, csv_saida, callback_log, callba
         for i, processo in enumerate(processos, 1):
             callback_log(f"[{i}/{total}] Consultando {processo}")
 
-            status = consultar_processo(driver, wait, processo)
+            dados = consultar_processo(driver, wait, processo)
 
             resultados.append({
                 "processo": processo,
-                "status": status
+                "status": dados["status"],
+                "nome_empreendimento": dados["nome_empreendimento"],
+                "email": dados["email"],
             })
 
-            if status == "ERRO":
+            if dados["status"] == "ERRO":
                 callback_log(f"  ✗ Erro na consulta")
             else:
-                callback_log(f"  ✓ {status}")
+                nome_log = dados["nome_empreendimento"] or "—"
+                email_log = dados["email"] or "—"
+                callback_log(f"  ✓ {dados['status']}")
+                callback_log(f"    Empreendimento: {nome_log}")
+                callback_log(f"    E-mail: {email_log}")
 
             time.sleep(1)
 
@@ -280,12 +477,12 @@ def iniciar_interface():
     root = tk.Tk()
     root.title("SEIA — Consulta de Processos")
     root.configure(bg=BG)
-    root.geometry("760x760")
-    root.minsize(680, 620)
+    root.geometry("760x800")
+    root.minsize(680, 660)
 
     root.update_idletasks()
     root.geometry(
-        f"760x760+{(root.winfo_screenwidth()-760)//2}+{(root.winfo_screenheight()-760)//2}"
+        f"760x800+{(root.winfo_screenwidth()-760)//2}+{(root.winfo_screenheight()-800)//2}"
     )
 
     def sep(parent):
@@ -456,7 +653,9 @@ def iniciar_interface():
         "2024.001.000456/INEMA/LIC-00456\n\n"
         "• Salvar em CSV UTF-8\n"
         "• Não alterar o nome da coluna\n"
-        "• Não deixar linhas vazias"
+        "• Não deixar linhas vazias\n\n"
+        "Dados extraídos por processo:\n"
+        "  → Status · Nome do Empreendimento · E-mail"
     )
 
     tk.Label(
@@ -558,14 +757,16 @@ def iniciar_interface():
     txt.tag_config("erro", foreground=ERRO_C)
     txt.tag_config("info", foreground="#9ca3bc")
     txt.tag_config("prog", foreground=ACENTO)
+    txt.tag_config("detalhe", foreground=SUBTEXTO)
 
     def add_log(msg):
         txt.config(state="normal")
 
         tag = (
             "erro" if ("✗" in msg or "Erro" in msg) else
-            "ok" if ("✓" in msg or "FINALIZADA" in msg) else
+            "ok"   if ("✓" in msg or "FINALIZADA" in msg) else
             "prog" if msg.startswith("[") else
+            "detalhe" if msg.startswith("    ") else
             "info"
         )
 
